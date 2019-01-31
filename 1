@@ -1,0 +1,302 @@
+install_ssl_letsencrypt() {
+  sed -i 's/tryWebRTCFirst="false"/tryWebRTCFirst="true"/g' /var/www/bigbluebutton/client/conf/config.xml
+
+  if ! grep -q $HOST /usr/local/bigbluebutton/core/scripts/bigbluebutton.yml; then
+    bbb-conf --setip $HOST
+  fi
+
+  mkdir -p /etc/nginx/ssl
+
+  need_pkg letsencrypt
+
+  if [ ! -f /etc/nginx/ssl/dhp-4096.pem ]; then
+    openssl dhparam -dsaparam  -out /etc/nginx/ssl/dhp-4096.pem 4096
+  fi
+
+  if [ ! -f /etc/letsencrypt/live/$HOST/fullchain.pem ]; then
+    rm -f /tmp/bigbluebutton.bak
+    if ! grep -q $HOST /etc/nginx/sites-available/bigbluebutton; then  # make sure we can do the challenge
+      cp /etc/nginx/sites-available/bigbluebutton /tmp/bigbluebutton.bak
+      cat <<HERE > /etc/nginx/sites-available/bigbluebutton
+server {
+  listen 80;
+  listen [::]:80;
+  server_name $HOST;
+  access_log  /var/log/nginx/bigbluebutton.access.log;
+  # BigBlueButton landing page.
+  location / {
+    root   /var/www/bigbluebutton-default;
+    index  index.html index.htm;
+    expires 1m;
+  }
+  # Redirect server error pages to the static page /50x.html
+  #
+  error_page   500 502 503 504  /50x.html;
+  location = /50x.html {
+    root   /var/www/nginx-default;
+  }
+}
+HERE
+      systemctl restart nginx
+    fi
+
+    if ! letsencrypt --email $EMAIL --agree-tos --rsa-key-size 4096 --webroot -w /var/www/bigbluebutton-default/ -d $HOST certonly; then
+      cp /tmp/bigbluebutton.bak /etc/nginx/sites-available/bigbluebutton
+      systemctl restart nginx
+      err "Let's Encrypt SSL request for $HOST did not succeed - exiting"
+    fi
+  fi
+
+  cat <<HERE > /etc/nginx/sites-available/bigbluebutton
+server {
+  listen 80;
+  listen [::]:80;
+  server_name $HOST;
+  listen 443 ssl;
+  listen [::]:443 ssl;
+    ssl_certificate /etc/letsencrypt/live/$HOST/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$HOST/privkey.pem;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
+    ssl_ciphers "ECDH+AESGCM:DH+AESGCM:ECDH+AES256:DH+AES256:ECDH+AES128:DH+AES:ECDH+3DES:DH+3DES:RSA+AESGCM:RSA+AES:RSA+3DES:!aNULL:!MD5:!DSS:!AES256";
+    ssl_prefer_server_ciphers on;
+    ssl_dhparam /etc/nginx/ssl/dhp-4096.pem;
+  access_log  /var/log/nginx/bigbluebutton.access.log;
+   # Handle RTMPT (RTMP Tunneling).  Forwards requests
+   # to Red5 on port 5080
+  location ~ (/open/|/close/|/idle/|/send/|/fcs/) {
+    proxy_pass         http://127.0.0.1:5080;
+    proxy_redirect     off;
+    proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
+    client_max_body_size       10m;
+    client_body_buffer_size    128k;
+    proxy_connect_timeout      90;
+    proxy_send_timeout         90;
+    proxy_read_timeout         90;
+    proxy_buffering            off;
+    keepalive_requests         1000000000;
+  }
+  # Handle desktop sharing tunneling.  Forwards
+  # requests to Red5 on port 5080.
+  location /deskshare {
+     proxy_pass         http://127.0.0.1:5080;
+     proxy_redirect     default;
+     proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
+     client_max_body_size       10m;
+     client_body_buffer_size    128k;
+     proxy_connect_timeout      90;
+     proxy_send_timeout         90;
+     proxy_read_timeout         90;
+     proxy_buffer_size          4k;
+     proxy_buffers              4 32k;
+     proxy_busy_buffers_size    64k;
+     proxy_temp_file_write_size 64k;
+     include    fastcgi_params;
+  }
+  # BigBlueButton landing page.
+  location / {
+    root   /var/www/bigbluebutton-default;
+    index  index.html index.htm;
+    expires 1m;
+  }
+  # Include specific rules for record and playback
+  include /etc/bigbluebutton/nginx/*.nginx;
+  #error_page  404  /404.html;
+  # Redirect server error pages to the static page /50x.html
+  #
+  error_page   500 502 503 504  /50x.html;
+  location = /50x.html {
+    root   /var/www/nginx-default;
+  }
+}
+HERE
+
+  if [ -f /etc/cron.d/renew-letsencrypt ]; then 
+    rm /etc/cron.d/renew-letsencrypt
+  fi
+
+  if [ ! -f /etc/cron.daily/renew-letsencrypt ]; then
+    cat <<HERE > /etc/cron.daily/renew-letsencrypt
+#!/bin/bash
+/usr/bin/letsencrypt renew >> /var/log/letsencrypt-renew.log
+/bin/systemctl reload nginx
+HERE
+  fi
+  chmod 644 /etc/cron.daily/renew-letsencrypt
+
+  # Setup rest of BigBlueButton Configuration for SSL
+  sed -i "s/<param name=\"wss-binding\"  value=\"[^\"]*\"\/>/<param name=\"wss-binding\"  value=\"$IP:7443\"\/>/g" /opt/freeswitch/conf/sip_profiles/external.xml
+
+  sed -i 's/http:/https:/g' /etc/bigbluebutton/nginx/sip.nginx
+  sed -i 's/5066/7443/g'    /etc/bigbluebutton/nginx/sip.nginx
+
+  sed -i 's/bigbluebutton.web.serverURL=http:/bigbluebutton.web.serverURL=https:/g' /var/lib/tomcat7/webapps/bigbluebutton/WEB-INF/classes/bigbluebutton.properties
+
+  sed -i 's/jnlpUrl=http/jnlpUrl=https/g'   /usr/share/red5/webapps/screenshare/WEB-INF/screenshare.properties
+  sed -i 's/jnlpFile=http/jnlpFile=https/g' /usr/share/red5/webapps/screenshare/WEB-INF/screenshare.properties
+
+  sed -i 's|http://|https://|g' /var/www/bigbluebutton/client/conf/config.xml
+
+  yq w -i /usr/local/bigbluebutton/core/scripts/bigbluebutton.yml playback_protocol https
+  chmod 644 /usr/local/bigbluebutton/core/scripts/bigbluebutton.yml 
+
+  if [ -f /var/lib/tomcat7/webapps/demo/bbb_api_conf.jsp ]; then
+    sed -i 's/String BigBlueButtonURL = "http:/String BigBlueButtonURL = "https:/g' /var/lib/tomcat7/webapps/demo/bbb_api_conf.jsp
+  fi
+
+  # Update GreenLight (if installed) to use SSL
+  if [ -f ~/greenlight/env ]; then
+    BIGBLUEBUTTONENDPOINT=$(cat /var/lib/tomcat7/webapps/bigbluebutton/WEB-INF/classes/bigbluebutton.properties | grep -v '#' | sed -n '/^bigbluebutton.web.serverURL/{s/.*=//;p}')/bigbluebutton/
+    sed -i "s|.*BIGBLUEBUTTON_ENDPOINT=.*|BIGBLUEBUTTON_ENDPOINT=$BIGBLUEBUTTONENDPOINT|" ~/greenlight/env
+    docker stop greenlight-v2
+    docker rm greenlight-v2
+    docker run -d -p 5000:80 --restart=unless-stopped -v ~/greenlight/db/production:/usr/src/app/db/production --env-file ~/greenlight/env --name greenlight-v2 bigbluebutton/greenlight:v2
+  fi
+
+  # Update HTML5 client (if installed) to use SSL
+  if [ -f  /usr/share/meteor/bundle/programs/server/assets/app/config/settings-production.json ]; then
+    sed -i "s|\"wsUrl.*|\"wsUrl\": \"wss://$HOST/bbb-webrtc-sfu\",|g" \
+      /usr/share/meteor/bundle/programs/server/assets/app/config/settings-production.json
+  fi
+
+  TARGET=/usr/local/bigbluebutton/bbb-webrtc-sfu/config/default.yml
+  if [ -f $TARGET ]; then
+    if grep -q kurentoIp $TARGET; then
+      yq w -i $TARGET kurentoIp "$IP"
+    else
+      yq w -i $TARGET kurento[0].ip "$IP"
+    fi
+    chown bigbluebutton:bigbluebutton $TARGET
+    chmod 644 $TARGET
+  fi
+}
+
+configure_coturn() {
+  cat <<HERE > /var/lib/tomcat7/webapps/bigbluebutton/WEB-INF/spring/turn-stun-servers.xml
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.springframework.org/schema/beans
+        http://www.springframework.org/schema/beans/spring-beans-2.5.xsd">
+    <bean id="stun0" class="org.bigbluebutton.web.services.turn.StunServer">
+        <constructor-arg index="0" value="stun:$COTURN_HOST"/>
+    </bean>
+    <bean id="turn0" class="org.bigbluebutton.web.services.turn.TurnServer">
+        <constructor-arg index="0" value="$COTURN_SECRET"/>
+        <constructor-arg index="1" value="turns:$COTURN_HOST:443?transport=tcp"/>
+        <constructor-arg index="2" value="86400"/>
+    </bean>
+    <bean id="stunTurnService"
+            class="org.bigbluebutton.web.services.turn.StunTurnService">
+        <property name="stunServers">
+            <set>
+                <ref bean="stun0"/>
+            </set>
+        </property>
+        <property name="turnServers">
+            <set>
+                <ref bean="turn0"/>
+            </set>
+        </property>
+    </bean>
+</beans>
+HERE
+}
+
+install_coturn() {
+  IP=$(hostname -I | cut -f1 -d' ')
+  if [ "$DIG_IP" != "$IP" ]; then err "DNS lookup for $COTURN_HOST resolved to $DIG_IP but didn't match local IP of $IP."; fi
+
+  apt-get update
+  apt-get -y -o DPkg::options::="--force-confdef" -o DPkg::options::="--force-confold" install grub-pc update-notifier-common
+  apt-get dist-upgrade -yq
+  need_pkg coturn
+
+  need_pkg software-properties-common 
+  need_ppa certbot-ubuntu-certbot-bionic.list ppa:certbot/certbot 75BCA694 7BF5
+  apt-get -y install certbot
+
+  certbot certonly --standalone --preferred-challenges http \
+    --deploy-hook "systemctl restart coturn" \
+    -d $COTURN_HOST --email $EMAIL --agree-tos -n
+
+  cat <<HERE > /etc/turnserver.conf
+# Example coturn configuration for BigBlueButton
+# These are the two network ports used by the TURN server which the client
+# may connect to. We enable the standard unencrypted port 3478 for STUN,
+# as well as port 443 for TURN over TLS, which can bypass firewalls.
+listening-port=3478
+tls-listening-port=443
+# If the server has multiple IP addresses, you may wish to limit which
+# addresses coturn is using. Do that by setting this option (it can be
+# specified multiple times). The default is to listen on all addresses.
+# You do not normally need to set this option.
+#listening-ip=172.17.19.101
+# If the server is behind NAT, you need to specify the external IP address.
+# If there is only one external address, specify it like this:
+#external-ip=172.17.19.120
+# If you have multiple external addresses, you have to specify which
+# internal address each corresponds to, like this. The first address is the
+# external ip, and the second address is the corresponding internal IP.
+#external-ip=172.17.19.131/10.0.0.11
+#external-ip=172.17.18.132/10.0.0.12
+# Fingerprints in TURN messages are required for WebRTC
+fingerprint
+# The long-term credential mechanism is required for WebRTC
+lt-cred-mech
+# Configure coturn to use the "TURN REST API" method for validating time-
+# limited credentials. BigBlueButton will generate credentials in this
+# format. Note that the static-auth-secret value specified here must match
+# the configuration in BigBlueButton's turn-stun-servers.xml
+# You can generate a new random value by running the command:
+#   openssl rand -hex 16
+use-auth-secret
+static-auth-secret=$COTURN_SECRET
+# If the realm value is unspecified, it defaults to the TURN server hostname.
+# You probably want to configure it to a domain name that you control to
+# improve log output. There is no functional impact.
+# realm=example.com
+# Configure TLS support.
+# Adjust these paths to match the locations of your certificate files
+cert=/etc/letsencrypt/live/$COTURN_HOST/fullchain.pem
+pkey=/etc/letsencrypt/live/$COTURN_HOST/privkey.pem
+# Limit the allowed ciphers to improve security
+# Based on https://hynek.me/articles/hardening-your-web-servers-ssl-ciphers/
+cipher-list="ECDH+AESGCM:ECDH+CHACHA20:DH+AESGCM:ECDH+AES256:DH+AES256:ECDH+AES128:DH+AES:RSA+AESGCM:RSA+AES:!aNULL:!MD5:!DSS"
+# Enable longer DH TLS key to improve security
+dh2066
+# All WebRTC-compatible web browsers support TLS 1.2 or later, so disable
+# older protocols
+no-tlsv1
+no-tlsv1_1
+# Log to a single filename (rather than new log files each startup). You'll
+# want to install a logrotate configuration (see below)
+log-file=/var/log/coturn.log
+HERE
+
+  cat <<HERE > /etc/logrotate.d/coturn
+/var/log/coturn.log
+{
+    rotate 30
+    daily
+    missingok
+    notifempty
+    delaycompress
+    compress
+    postrotate
+    systemctl kill -sHUP coturn.service
+    endscript
+}
+HERE
+
+  sed -i 's/#TURNSERVER_ENABLED=1/TURNSERVER_ENABLED=1/g' /etc/default/coturn
+  systemctl restart coturn
+
+  cat 1>&2 <<HERE
+This TURN server is setup and ready for use with BigBlueButton.  On your BigBlueButton server run the bbb-install.sh command again with the original parameters and add 
+  -c $COTURN_HOST:$COTURN_SECRET
+HERE
+}
+
+main "$@" || exit 1
